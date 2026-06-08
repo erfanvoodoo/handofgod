@@ -1,7 +1,3 @@
-<<<<<<< HEAD
-# HandofGod
-A reliable, authenticated transport protocol that tunnels data over DNS. Uses Noise NK handshake (X25519), ChaCha20-Poly1305 or AES-256-GCM encryption, sliding-window ARQ with SACK, and multi-path scheduling across resolvers. Shaped traffic mimics ordinary DNS. Works where TCP, UDP, and QUIC are blocked.
-=======
 # Hand of God
 
 **A reliable, authenticated, multi-path transport protocol over DNS.**
@@ -337,4 +333,3 @@ and availability when other protocols struggle.
 ## License
 
 MIT.
->>>>>>> 03074ff (Initial commit)
