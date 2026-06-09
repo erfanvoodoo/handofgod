@@ -1,0 +1,15 @@
+# Build artifacts
+/bin/
+*.exe
+*.test
+*.out
+
+# Server static key — secret, generated at runtime; never commit
+*.key
+
+# Local config overrides
+*.local.json
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
