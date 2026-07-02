@@ -84,7 +84,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	handler := newTunnelHandler(*allowDest, vlogf)
+	handler := newTunnelHandler(*allowDest, *zone, *mode, vlogf)
 	defer handler.shutdown()
 
 	var lis *transport.Listener

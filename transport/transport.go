@@ -78,6 +78,7 @@ type Stats struct {
 	InFlight     int    // unacked reliable frames
 	Delivered    uint64 // frames delivered in order to the app
 	DroppedIn    uint64 // inbound datagrams that failed to decode (cover/corrupt/replay)
+	DroppedOut   uint64 // outbound datagrams dropped by the DNS scheduler (queue full or EncodeFQDNMode over the per-mode FQDN limit)
 	HealthyPaths int
 	Profile      string
 	Level        string
@@ -475,6 +476,7 @@ func (s *Session) Stats() Stats {
 		InFlight:     s.sender.Stats().InFlight,
 		Delivered:    s.receiver.Stats().Delivered,
 		DroppedIn:    atomic.LoadUint64(&s.droppedIn),
+		DroppedOut:   cs.Dropped,
 		HealthyPaths: s.cfg.Engine.HealthyCount(),
 		Profile:      cs.Profile,
 		Level:        cs.Level,

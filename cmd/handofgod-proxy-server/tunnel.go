@@ -68,17 +68,31 @@ type tunnelHandler struct {
 	logf      func(format string, a ...any)
 	stop      chan struct{}
 	stopOnce  sync.Once
+
+	// zone and mode are the deployment-fixed settings needed to compute the
+	// per-Write app-payload ceiling (chunk.go: maxWritePayload). Larger writes
+	// are silently dropped by dns.Client, so the read loops must pre-chunk.
+	zone      string
+	mode      string
+	chunkSize int // maxWritePayload(zone, mode) minus 1 for the 'D' type byte
 }
 
-func newTunnelHandler(allowDest string, logf func(string, ...any)) *tunnelHandler {
+func newTunnelHandler(allowDest, zone, mode string, logf func(string, ...any)) *tunnelHandler {
 	if logf == nil {
 		logf = func(string, ...any) {}
+	}
+	chunk := maxWritePayload(zone, mode) - 1 // reserve 1 byte for the 'D' prefix
+	if chunk < 1 {
+		chunk = 1
 	}
 	h := &tunnelHandler{
 		tunnels:   make(map[tunnelKey]*tunnel),
 		allowDest: allowDest,
 		logf:      logf,
 		stop:      make(chan struct{}),
+		zone:      zone,
+		mode:      mode,
+		chunkSize: chunk,
 	}
 	go h.sweepLoop()
 	return h
@@ -224,8 +238,12 @@ func (h *tunnelHandler) dispatchFin(tun *tunnel) {
 	}
 }
 
-// pipeRemoteToSession reads from the remote TCP socket and Writes each chunk
-// downstream as a 'D' message. On EOF/error it sends a single 'F' marker.
+// pipeRemoteToSession reads from the remote TCP socket and Writes chunks
+// downstream as 'D' messages. Each read is split into slices of at most
+// h.chunkSize bytes so no single Write exceeds dns.Client's per-mode payload
+// ceiling (see chunk.go). ARQ reassembles in seq order on the client, and
+// sender.Next assigns seqs in call order, so ordering is preserved. On
+// EOF/error it sends a single 'F' marker.
 func (h *tunnelHandler) pipeRemoteToSession(tun *tunnel) {
 	tun.mu.Lock()
 	conn := tun.conn
@@ -237,10 +255,15 @@ func (h *tunnelHandler) pipeRemoteToSession(tun *tunnel) {
 	buf := make([]byte, remoteReadBufSize)
 	for {
 		n, err := conn.Read(buf)
-		if n > 0 {
-			out := make([]byte, 1+n)
-			out[0] = msgData
-			copy(out[1:], buf[:n])
+		// Emit each read as one or more D chunks, each ≤ h.chunkSize bytes.
+		for off := 0; off < n; {
+			end := off + h.chunkSize
+			if end > n {
+				end = n
+			}
+			msg := make([]byte, 1+(end-off))
+			msg[0] = msgData
+			copy(msg[1:], buf[off:end])
 			tun.mu.Lock()
 			tun.lastActivity = time.Now()
 			closed := tun.closed
@@ -248,7 +271,8 @@ func (h *tunnelHandler) pipeRemoteToSession(tun *tunnel) {
 			if closed {
 				return
 			}
-			tun.sess.Write(tun.key.stream, out)
+			tun.sess.Write(tun.key.stream, msg)
+			off = end
 		}
 		if err != nil {
 			tun.mu.Lock()

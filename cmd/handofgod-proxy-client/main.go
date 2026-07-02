@@ -192,14 +192,28 @@ func (d *carrierDialer) dial(ctx context.Context, deliver func(uint16, []byte), 
 
 // tunnelSink stitches incoming Hand of God messages into the two logical
 // events the SOCKS5 handler needs: the CONNECT reply (hello) and downstream
-// bytes/EOF. Deliver is called serially by the transport, so we can mutate
-// awaitingHello under mu without worrying about reentrancy.
+// bytes/EOF. Deliver is called serially by the transport under recvMu, so
+// awaitingHello is safe to read/write without additional locking; we keep mu
+// here defensively (the transport's serialization guarantee is a contract
+// worth being explicit about).
+//
+// Ordering fence for downstream data:
+//
+//	replyReady is closed by handleClient IMMEDIATELY AFTER writeReply for
+//	repSuccess completes. Any msgData arriving before that blocks in deliver
+//	on <-replyReady, so the SOCKS5 client ALWAYS reads the reply bytes before
+//	any payload bytes. handleClient also defers signalReplyReady() as a
+//	safety net so error paths never leave deliver hung.
 type tunnelSink struct {
 	mu            sync.Mutex
 	awaitingHello bool
 	local         net.Conn
 	helloOnce     sync.Once
 	helloDone     chan helloResult
+
+	replyReadyOnce sync.Once
+	replyReady     chan struct{}
+
 	remoteFinOnce sync.Once
 	remoteFin     chan struct{}
 	writeErrOnce  sync.Once
@@ -216,9 +230,17 @@ func newTunnelSink(local net.Conn) *tunnelSink {
 		awaitingHello: true,
 		local:         local,
 		helloDone:     make(chan helloResult, 1),
+		replyReady:    make(chan struct{}),
 		remoteFin:     make(chan struct{}),
 		writeErr:      make(chan struct{}),
 	}
+}
+
+// signalReplyReady tells any blocked deliver('D') that the SOCKS5 reply has
+// been written and downstream payload may now flow to the local socket.
+// Idempotent — safe to call from both the success path and a defer.
+func (s *tunnelSink) signalReplyReady() {
+	s.replyReadyOnce.Do(func() { close(s.replyReady) })
 }
 
 func (s *tunnelSink) deliver(_ uint16, data []byte) {
@@ -246,6 +268,13 @@ func (s *tunnelSink) deliver(_ uint16, data []byte) {
 
 	switch data[0] {
 	case msgData:
+		// Ordering fence: never write payload bytes before the SOCKS5 reply.
+		// replyReady is closed once handleClient's writeReply(repSuccess)
+		// returns (or on any error-path defer), so this blocks at most one
+		// local-socket write latency for the first D. Deliver is called under
+		// the transport's recvMu, so this pause serializes downstream frames
+		// naturally.
+		<-s.replyReady
 		if _, err := s.local.Write(data[1:]); err != nil {
 			s.writeErrOnce.Do(func() { close(s.writeErr) })
 		}
@@ -297,6 +326,10 @@ func handleClient(ctx context.Context, local net.Conn, dialer *carrierDialer) {
 	_ = local.SetDeadline(time.Time{})
 
 	sink := newTunnelSink(local)
+	// Safety net: no matter how handleClient exits, unblock any deliver('D')
+	// that might be waiting on the ordering fence. Idempotent.
+	defer sink.signalReplyReady()
+
 	sess, shutdown, err := dialer.dial(ctx, sink.deliver, func(code byte) {
 		vlogf("session closed by peer (code %d)", code)
 		sink.remoteFinOnce.Do(func() { close(sink.remoteFin) })
@@ -329,24 +362,38 @@ func handleClient(ctx context.Context, local net.Conn, dialer *carrierDialer) {
 		return
 	}
 
-	// Success — send SOCKS5 reply, then start bidirectional forwarding.
+	// Success — send SOCKS5 reply, then release the ordering fence so any
+	// buffered downstream payload can now be written to the local socket.
 	if err := writeReply(local, repSuccess, req); err != nil {
 		vlogf("reply write: %v", err)
 		return
 	}
+	sink.signalReplyReady()
 
-	// local → session
+	// local → session. Each Read is split into chunks of at most `chunk`
+	// bytes so no single Session.Write exceeds dns.Client's per-mode payload
+	// ceiling (see chunk.go). ARQ reassembles in seq order on the far side;
+	// sender.Next assigns seqs in call order, so ordering is preserved.
+	chunk := maxWritePayload(dialer.zone, dialer.mode) - 1 // reserve 1 byte for 'D'
+	if chunk < 1 {
+		chunk = 1
+	}
 	localReadDone := make(chan struct{})
 	go func() {
 		defer close(localReadDone)
 		buf := make([]byte, localReadBuf)
 		for {
 			n, err := local.Read(buf)
-			if n > 0 {
-				out := make([]byte, 1+n)
-				out[0] = msgData
-				copy(out[1:], buf[:n])
-				sess.Write(tunnelStream, out)
+			for off := 0; off < n; {
+				end := off + chunk
+				if end > n {
+					end = n
+				}
+				msg := make([]byte, 1+(end-off))
+				msg[0] = msgData
+				copy(msg[1:], buf[off:end])
+				sess.Write(tunnelStream, msg)
+				off = end
 			}
 			if err != nil {
 				sess.Write(tunnelStream, []byte{msgFin})
